@@ -632,6 +632,7 @@ $(HOME)/.helm:
 
 # create istio-remote.yaml
 istio-remote.yaml: $(HELM) $(HOME)/.helm
+>>>>>>> Remove external dependencies on helm repo for build
 	cat install/kubernetes/namespace.yaml > install/kubernetes/$@
 	cat install/kubernetes/helm/istio-init/files/crd-* >> install/kubernetes/$@
 	$(HELM) template --name=istio --namespace=istio-system \
@@ -642,6 +643,7 @@ istio-remote.yaml: $(HELM) $(HOME)/.helm
 
 # create istio-init.yaml
 istio-init.yaml: $(HELM) $(HOME)/.helm
+>>>>>>> Remove external dependencies on helm repo for build
 	cat install/kubernetes/namespace.yaml > install/kubernetes/$@
 	cat install/kubernetes/helm/istio-init/files/crd-* >> install/kubernetes/$@
 	$(HELM) template --name=istio --namespace=istio-system \
