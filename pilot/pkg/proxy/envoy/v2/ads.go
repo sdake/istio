@@ -865,6 +865,8 @@ func (s *DiscoveryServer) startPush(version string, push *model.PushContext, ful
 				adsLog.Infof("PushAll abort %s, push with newer version %s in progress %v", version, currentVersion, time.Since(tstart))
 				return
 			}
+			adsLog.Warnf("Pushing an event to ADS")
+			timer := time.NewTimer(PushTimeout)
 
 			select {
 			case client.pushChannel <- &XdsEvent{
@@ -875,9 +877,12 @@ func (s *DiscoveryServer) startPush(version string, push *model.PushContext, ful
 			}:
 				client.LastPush = time.Now()
 				client.LastPushFailure = timeZero
+				if !timer.Stop() {
+					<-timer.C
+				}
 			case <-client.stream.Context().Done(): // grpc stream was closed
 				adsLog.Infof("Client closed connection %v", client.ConID)
-			case <-time.After(PushTimeout):
+			case <-timer.C:
 				// This may happen to some clients if the other side is in a bad state and can't receive.
 				// The tests were catching this - one of the client was not reading.
 				pushTimeouts.Add(1)
@@ -894,9 +899,17 @@ func (s *DiscoveryServer) startPush(version string, push *model.PushContext, ful
 						return
 					}
 				}
+				if !timer.Stop() {
+					<-timer.C
+				}
+				adsLog.Warnf("Done pushing an event in ADS- Retry")
 
 				goto Retry
 			}
+			if !timer.Stop() {
+				<-timer.C
+			}
+			adsLog.Warnf("Done pushing an event in ADS")
 		}()
 	}
 
