@@ -711,6 +711,7 @@ func FetchAndSaveClusterLogs(namespace string, tempDir string, kubeconfig string
 		describeCmd := fmt.Sprintf("kubectl -n %s describe pod %s --kubeconfig=%s",
 			namespace, pod, kubeconfig)
 		describeOutput, errDescribe := ShellMuteOutput(describeCmd)
+		log.Warnf("DescribeOutput = %v\n", describeOutput)
 		if errDescribe != nil {
 			log.Warnf("Error getting description for pod %s: %v\n", pod, errDescribe)
 			// don't bail, keep going
