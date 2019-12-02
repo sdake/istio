@@ -63,29 +63,8 @@ ifeq ($(GO),)
   $(error Could not find 'go' in path.  Please install go, or if already installed either add it to your path or set GO to point to its directory)
 endif
 
-LOCAL_ARCH := $(shell uname -m)
-ifeq ($(LOCAL_ARCH),x86_64)
-GOARCH_LOCAL := amd64
-else ifeq ($(shell echo $(LOCAL_ARCH) | head -c 5),armv8)
-GOARCH_LOCAL := arm64
-else ifeq ($(shell echo $(LOCAL_ARCH) | head -c 4),armv)
-GOARCH_LOCAL := arm
-else
-GOARCH_LOCAL := $(LOCAL_ARCH)
-endif
-export GOARCH ?= $(GOARCH_LOCAL)
-
-LOCAL_OS := $(shell uname)
-ifeq ($(LOCAL_OS),Linux)
-   export GOOS_LOCAL = linux
-else ifeq ($(LOCAL_OS),Darwin)
-   export GOOS_LOCAL = darwin
-else
-   $(error "This system's OS $(LOCAL_OS) isn't recognized/supported")
-   # export GOOS_LOCAL ?= windows
-endif
-
-export GOOS ?= $(GOOS_LOCAL)
+GOARCH_LOCAL := $(TARGET_ARCH)
+GOOS_LOCAL := $(TARGET_OS)
 
 export ENABLE_COREDUMP ?= false
 
@@ -133,12 +112,18 @@ GO_FILES_CMD := find . -name '*.go' | grep -v -E '$(GO_EXCLUDE)'
 # Environment for tests, the directory containing istio and deps binaries.
 # Typically same as GOPATH/bin, so tests work seemlessly with IDEs.
 
-export ISTIO_BIN=$(GO_TOP)/bin
+export ISTIO_BIN=$(GOBIN)
 # Using same package structure as pkg/
+
+ifeq ($(IN_BUILD_CONTAINER),0)
 export OUT_DIR=$(GO_TOP)/out
-export ISTIO_OUT:=$(OUT_DIR)/$(GOOS)_$(GOARCH)/$(BUILDTYPE_DIR)
-export ISTIO_OUT_LINUX:=$(OUT_DIR)/linux_amd64/$(BUILDTYPE_DIR)
-export HELM=$(ISTIO_OUT)/helm
+else
+export OUT_DIR=/work/out
+endif
+
+export ISTIO_OUT:=$(TARGET_OUT)
+export ISTIO_OUT_LINUX:=$(GOBIN)
+export HELM=helm
 export ARTIFACTS ?= $(ISTIO_OUT)
 export REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
@@ -288,7 +273,7 @@ sync: init
 # lock file, but it caused the rule for that file to get run (which
 # seems to be about obtaining a new version of the 3rd party libraries).
 $(ISTIO_OUT)/istio_is_init: bin/init.sh istio.deps | $(ISTIO_OUT)
-	ISTIO_OUT=$(ISTIO_OUT) bin/init.sh
+	ISTIO_OUT=$(ISTIO_OUT) ISTIO_BIN=$(ISTIO_BIN) bin/init.sh
 	touch $(ISTIO_OUT)/istio_is_init
 
 # init.sh downloads envoy
@@ -301,7 +286,7 @@ ${ISTIO_ENVOY_MACOS_RELEASE_PATH}: init
 # Developers must manually run `dep ensure` if adding new deps
 depend: init | $(ISTIO_OUT)
 
-OUTPUT_DIRS = $(ISTIO_OUT) $(ISTIO_BIN)
+OUTPUT_DIRS = $(ISTIO_OUT)
 DIRS_TO_CLEAN+=${ISTIO_OUT}
 ifneq ($(ISTIO_OUT),$(ISTIO_OUT_LINUX))
   OUTPUT_DIRS += $(ISTIO_OUT_LINUX)
