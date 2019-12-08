@@ -58,7 +58,8 @@ ifeq ($(BUILD_WITH_CONTAINER),1)
 export TARGET_OUT = /work/out/$(TARGET_OS)_$(TARGET_ARCH)
 CONTAINER_CLI ?= docker
 DOCKER_SOCKET_MOUNT ?= -v /var/run/docker.sock:/var/run/docker.sock
-IMG ?= gcr.io/istio-testing/build-tools:master-2019-12-04T21-25-52
+#IMG ?= gcr.io/istio-testing/build-tools:master-2019-12-04T21-25-52
+IMG ?= docker.io/sdake/build-tools:HEAD-latest
 UID = $(shell id -u)
 GID = `grep docker /etc/group | cut -f3 -d:`
 PWD = $(shell pwd)
@@ -91,7 +92,7 @@ ifdef TAG
 ENV_VARS+=-e TAG="$(TAG)"
 endif
 
-RUN = $(CONTAINER_CLI) run -t -i --sig-proxy=true -u $(UID):$(GID) --rm \
+RUN = $(CONTAINER_CLI) run -t -i --sig-proxy=true --privileged -u $(UID):$(GID) --rm \
 	-e IN_BUILD_CONTAINER="$(BUILD_WITH_CONTAINER)" \
 	-e TZ="$(TIMEZONE)" \
 	-e TARGET_ARCH="$(TARGET_ARCH)" \
@@ -105,6 +106,7 @@ RUN = $(CONTAINER_CLI) run -t -i --sig-proxy=true -u $(UID):$(GID) --rm \
 	--mount type=bind,source="$(PWD)",destination="/work" \
 	--mount type=volume,source=go,destination="/go" \
 	--mount type=volume,source=gocache,destination="/gocache" \
+	--mount type=volume,source=go-mod,destination="/go/pkg/mod" \
 	$(DOCKER_CREDS_MOUNT) \
 	-w /work $(IMG)
 

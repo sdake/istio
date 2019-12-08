@@ -591,7 +591,7 @@ clean: clean.go
 
 clean.go: ; $(info $(H) cleaning...)
 	$(eval GO_CLEAN_FLAGS := -i -r)
-	$(Q) $(GO) clean $(GO_CLEAN_FLAGS)
+	$(Q) strace $(GO) clean $(GO_CLEAN_FLAGS)
 
 #-----------------------------------------------------------------------------
 # Target: docker
