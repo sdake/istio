@@ -83,6 +83,11 @@ $(info Using gcr credential directory $(HOME)/.config/gcloud.)
 DOCKER_CREDS_MOUNT+=--mount type=bind,source="$(HOME)/.config/gcloud",destination="/config/.config/gcloud",readonly
 endif
 
+ifneq (,$(wildcard $(HOME)/.kube))
+$(info Using local Kubernetes configuration $(HOME)/.kube)
+DOCKER_CREDS_MOUNT+=--mount type=bind,source="$(HOME)/.kube",destination="/home/.kube",readonly
+endif
+
 ENV_VARS:=
 ifdef HUB
 ENV_VARS+=-e HUB="$(HUB)"
