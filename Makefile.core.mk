@@ -257,7 +257,7 @@ ${ISTIO_BIN}/have_go_$(GO_VERSION_REQUIRED):
 
 
 # Downloads envoy, based on the SHA defined in the base pilot Dockerfile
-init: check-go-version $(ISTIO_OUT)/istio_is_init
+init: check-go-version $(ISTIO_OUT)/istio_is_init | $(ISTIO_OUT)
 	mkdir -p ${TARGET_OUT}/logs
 
 # Sync is the same as init in release branch. In master this pulls from master.
