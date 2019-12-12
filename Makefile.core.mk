@@ -121,6 +121,9 @@ export HELM=helm
 export ARTIFACTS ?= $(ISTIO_OUT)
 export REPO_ROOT := $(shell git rev-parse --show-toplevel)
 
+# Make directories needed by the build system
+$(shell mkdir -p $(ISTIO_OUT))
+
 # scratch dir: this shouldn't be simply 'docker' since that's used for docker.save to store tar.gz files
 ISTIO_DOCKER:=${ISTIO_OUT}/docker_temp
 # Config file used for building istio:proxy container.
