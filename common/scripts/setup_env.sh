@@ -103,13 +103,34 @@ if [[ -d "${HOME}/.config/gcloud" ]]; then
   CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${HOME}/.config/gcloud,destination=/config/.config/gcloud,readonly "
 fi
 
-# Conditional host mount if KUBECONFIG is set
-if [[ -n "${KUBECONFIG}" ]]; then
-  CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=$(dirname "${KUBECONFIG}"),destination=/home/.kube,readonly "
-elif [[ -f "${HOME}/.kube/config" ]]; then
-  # otherwise execute a conditional host mount if $HOME/.kube/config is set
-  CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${HOME}/.kube,destination=/home/.kube,readonly "
+# This function is designed for maximum compatibility with various platforms. This runs on
+# any Mac or Linux platform with bash 4.2+. Please take care not to modify this function
+# without testing properly.
+#
+# This function will properly handle any type of path including those with spaces using the
+# loading pattern specified by kubectl config.
+
+# testcase: "a:b c:d"
+# testcase: "a b:c d:e f"
+# testcase: "a b:c:d e"
+parse_KUBECONFIG () {
+if [[ "$1" =~ ([^:]*):(.*) ]]; then
+        while true; do
+		CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${BASH_REMATCH[1]},destination=/config/$(basename ${BASH_REMATCH[1]}),readonly "
+                remainder="${BASH_REMATCH[2]}"
+                if [[ ! "$remainder" =~ ([^:]*):(.*) ]]; then
+                        if [[ ! -z "$remainder" ]]; then
+				CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${remainder},destination=/config/$(basename ${remainder}),readonly "
+                                break
+                        fi
+                fi
+        done
+else
+	CONDITIONAL_HOST_MOUNTS+="--mount type=bind,source=${1},destination=/config/$(basename ${1}),readonly "
 fi
+}
+
+parse_KUBECONFIG "${KUBECONFIG}"
 
 # Avoid recursive calls to make from attempting to start an additional container
 export BUILD_WITH_CONTAINER=0
