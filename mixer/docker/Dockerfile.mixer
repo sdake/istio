@@ -11,7 +11,6 @@ FROM docker.io/istio/base:${BASE_VERSION} as default
 FROM docker.io/istio/distroless:${BASE_VERSION} as distroless
 
 # This will build the final image based on either default or distroless from above
-# hadolint ignore=DL3006
 
 COPY mixs /usr/local/bin/
 
