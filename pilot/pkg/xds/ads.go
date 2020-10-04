@@ -157,9 +157,23 @@ func (s *DiscoveryServer) receive(con *Connection, reqChannel chan *discovery.Di
 					s.InternalGen.OnDisconnect(con)
 				}
 			}()
+			if features.EnableFlowControl {
+				adsLog.Infof("sempost recv")
+				con.semaphore <- struct{}{}
+			}
 		}
 
-		if !s.shouldRespond(con, req) {
+		// Determine ACK/NACK response
+		respond := s.shouldRespond(con, req)
+		if !respond {
+			if features.EnableFlowControl {
+				adsLog.Infof("semwait1 within recv thread")
+				<-con.semaphore
+			}
+			if features.EnableFlowControl {
+				adsLog.Infof("sempost recv")
+				con.semaphore <- struct{}{}
+			}
 			continue
 		}
 
@@ -254,35 +268,35 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 				return receiveError
 			}
 
-			// Wait for signal from receive thread
-			if features.EnableFlowControl {
-				con.semaphore <- struct{}{}
-			}
 
 			// processRequest is calling pushXXX, accessing common structs with pushConnection.
 			// Adding sync is the second issue to be resolved if we want to save 1/2 of the threads.
 			err := s.processRequest(req, con)
 			if err != nil {
-				if features.EnableFlowControl {
-					<-con.semaphore
-				}
 				return err
 			}
 
 		case pushEv := <-con.pushChannel:
-			// Wait for signal from receive thread
-			if features.EnableFlowControl {
-				con.semaphore <- struct{}{}
-			}
-
 			// TODO: possible race condition: if a config change happens while the envoy
 			// was getting the initial config, between LDS and RDS, the push will miss the
 			// monitored 'routes'. Same for CDS/EDS interval. It is very tricky to handle
 			// due to the protocol - but the periodic push recovers from it.
+			if features.EnableFlowControl {
+				adsLog.Infof("semwait2 within send thread")
+				<-con.semaphore
+			}
 			err := s.pushConnection(con, pushEv)
 			pushEv.done()
 			if err != nil {
+				if features.EnableFlowControl {
+					adsLog.Infof("Closing semaphore channel")
+					close(con.semaphore)
+				}
 				return nil
+			}
+			if features.EnableFlowControl {
+				adsLog.Infof("sempost2 within send thread")
+				con.semaphore <- struct{}{}
 			}
 		}
 	}
@@ -311,6 +325,7 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 		con.proxy.Lock()
 		delete(con.proxy.WatchedResources, request.TypeUrl)
 		con.proxy.Unlock()
+		adsLog.Infof("shouldRespond1")
 		return false
 	}
 
@@ -320,6 +335,7 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 		con.proxy.Lock()
 		con.proxy.WatchedResources[request.TypeUrl] = &model.WatchedResource{TypeUrl: request.TypeUrl, ResourceNames: request.ResourceNames, LastRequest: request}
 		con.proxy.Unlock()
+		adsLog.Infof("shouldRespond2")
 		return true
 	}
 
@@ -336,6 +352,7 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 		con.proxy.Lock()
 		con.proxy.WatchedResources[request.TypeUrl] = &model.WatchedResource{TypeUrl: request.TypeUrl, ResourceNames: request.ResourceNames, LastRequest: request}
 		con.proxy.Unlock()
+		adsLog.Infof("shouldRespond3")
 		return true
 	}
 
@@ -345,6 +362,8 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 		adsLog.Debugf("ADS:%s: REQ %s Expired nonce received %s, sent %s", stype,
 			con.ConID, request.ResponseNonce, previousInfo.NonceSent)
 		xdsExpiredNonce.Increment()
+		adsLog.Infof("shouldRespond4")
+
 		return false
 	}
 
@@ -358,21 +377,17 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 	con.proxy.WatchedResources[request.TypeUrl].LastRequest = request
 	con.proxy.Unlock()
 
-	// Signal waiting semaphore in push operations that a valid
-	// ACK has been processed as determined by matched nonce
-	if features.EnableFlowControl {
-		<-con.semaphore
-	}
-
 	// Envoy can send two DiscoveryRequests with same version and nonce
 	// when it detects a new resource. We should respond if they change.
 	if listEqualUnordered(previousResources, request.ResourceNames) {
 		adsLog.Debugf("ADS:%s: ACK %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
+		adsLog.Infof("shouldRespond5")
 		return false
 	}
 	adsLog.Debugf("ADS:%s: RESOURCE CHANGE previous resources: %v, new resources: %v %s %s %s", stype,
 		previousResources, request.ResourceNames, con.ConID, request.VersionInfo, request.ResponseNonce)
 
+	adsLog.Infof("shouldRespond6")
 	return true
 }
 
