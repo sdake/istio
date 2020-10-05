@@ -84,7 +84,9 @@ type Connection struct {
 	node *core.Node
 
 	// Outstanding push events on this connection
-	semaphore chan struct{}
+	semsend chan struct{}
+
+	semrecv chan struct{}
 }
 
 // Event represents a config or registry event that results in a push.
@@ -102,7 +104,8 @@ func newConnection(peerAddr string, stream DiscoveryStream) *Connection {
 		PeerAddr:    peerAddr,
 		Connect:     time.Now(),
 		stream:      stream,
-		semaphore:   make(chan struct{}, 1),
+		semsend:   make(chan struct{}, 1),
+		semrecv:make(chan struct{}, 1),
 	}
 }
 
@@ -157,23 +160,16 @@ func (s *DiscoveryServer) receive(con *Connection, reqChannel chan *discovery.Di
 					s.InternalGen.OnDisconnect(con)
 				}
 			}()
+			// unclear if this is needed or handled by shouldRespond cases
 			if features.EnableFlowControl {
-				adsLog.Infof("sempost recv")
-				con.semaphore <- struct{}{}
+				adsLog.Infof("sempost new connection")
+				con.semrecv <- struct{}{}
 			}
 		}
 
 		// Determine ACK/NACK response
 		respond := s.shouldRespond(con, req)
 		if !respond {
-			if features.EnableFlowControl {
-				adsLog.Infof("semwait1 within recv thread")
-				<-con.semaphore
-			}
-			if features.EnableFlowControl {
-				adsLog.Infof("sempost recv")
-				con.semaphore <- struct{}{}
-			}
 			continue
 		}
 
@@ -283,20 +279,20 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 			// due to the protocol - but the periodic push recovers from it.
 			if features.EnableFlowControl {
 				adsLog.Infof("semwait2 within send thread")
-				<-con.semaphore
+				<-con.semsend
 			}
 			err := s.pushConnection(con, pushEv)
 			pushEv.done()
 			if err != nil {
 				if features.EnableFlowControl {
-					adsLog.Infof("Closing semaphore channel")
-					close(con.semaphore)
+					adsLog.Infof("Closing semsend channel")
+					close(con.semsend)
 				}
 				return nil
 			}
 			if features.EnableFlowControl {
 				adsLog.Infof("sempost2 within send thread")
-				con.semaphore <- struct{}{}
+				con.semrecv <- struct{}{}
 			}
 		}
 	}
@@ -352,7 +348,15 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 		con.proxy.Lock()
 		con.proxy.WatchedResources[request.TypeUrl] = &model.WatchedResource{TypeUrl: request.TypeUrl, ResourceNames: request.ResourceNames, LastRequest: request}
 		con.proxy.Unlock()
-		adsLog.Infof("shouldRespond3")
+		adsLog.Infof("shouldRespond3 - ACK? - should signal send")
+		if features.EnableFlowControl {
+			adsLog.Infof("semwait1 within recv thread")
+			<-con.semrecv
+		}
+		if features.EnableFlowControl {
+			adsLog.Infof("sempost1 within recv thread")
+			con.semsend <- struct{}{}
+		}
 		return true
 	}
 
@@ -381,13 +385,30 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 	// when it detects a new resource. We should respond if they change.
 	if listEqualUnordered(previousResources, request.ResourceNames) {
 		adsLog.Debugf("ADS:%s: ACK %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
-		adsLog.Infof("shouldRespond5")
+		adsLog.Infof("shouldRespond5 - ACK - should signal new send")
+		if features.EnableFlowControl {
+			adsLog.Infof("semwait1 within recv thread")
+			<-con.semrecv
+		}
+		if features.EnableFlowControl {
+			adsLog.Infof("sempost1 within recv thread")
+			con.semsend <- struct{}{}
+		}
 		return false
 	}
 	adsLog.Debugf("ADS:%s: RESOURCE CHANGE previous resources: %v, new resources: %v %s %s %s", stype,
 		previousResources, request.ResourceNames, con.ConID, request.VersionInfo, request.ResponseNonce)
 
+		// IS this an ACK or a NACK?
 	adsLog.Infof("shouldRespond6")
+		if features.EnableFlowControl {
+			adsLog.Infof("semwait1 within recv thread")
+			<-con.semrecv
+		}
+		if features.EnableFlowControl {
+			adsLog.Infof("sempost1 within recv thread")
+			con.semsend <- struct{}{}
+		}
 	return true
 }
 
