@@ -15,6 +15,7 @@
 package xds
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
@@ -83,10 +85,8 @@ type Connection struct {
 	// This is included in internal events.
 	node *core.Node
 
-	// Outstanding push events on this connection
-	semsend chan struct{}
-
-	semrecv chan struct{}
+	// A map of channels representing each resource type
+	sem map[string]*semaphore.Weighted
 }
 
 // Event represents a config or registry event that results in a push.
@@ -158,11 +158,6 @@ func (s *DiscoveryServer) receive(con *Connection, reqChannel chan *discovery.Di
 					s.InternalGen.OnDisconnect(con)
 				}
 			}()
-			// unclear if this is needed or handled by shouldRespond cases
-			if features.EnableFlowControl {
-				adsLog.Infof("sempost new connection")
-				con.semrecv <- struct{}{}
-			}
 		}
 
 		// Determine ACK/NACK response
@@ -233,10 +228,15 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 
 	con := newConnection(peerAddr, stream)
 	con.Identities = ids
-	// Initialize the send and receive semaphores
+
+	// Initialize the semaphore
 	if features.EnableFlowControl {
-		con.semsend = make(chan struct{}, 1)
-		con.semrecv = make(chan struct{}, 1)
+		con.sem = make(map[string]*semaphore.Weighted)
+
+		con.sem[v3.ClusterType] = semaphore.NewWeighted(1)
+		con.sem[v3.EndpointType] = semaphore.NewWeighted(1)
+		con.sem[v3.ListenerType] = semaphore.NewWeighted(1)
+		con.sem[v3.RouteType] = semaphore.NewWeighted(1)
 	}
 
 	// Do not call: defer close(con.pushChannel). The push channel will be garbage collected
@@ -267,7 +267,6 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 				return receiveError
 			}
 
-
 			// processRequest is calling pushXXX, accessing common structs with pushConnection.
 			// Adding sync is the second issue to be resolved if we want to save 1/2 of the threads.
 			err := s.processRequest(req, con)
@@ -276,40 +275,48 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 			}
 
 		case pushEv := <-con.pushChannel:
-			// TODO: possible race condition: if a config change happens while the envoy
-			// was getting the initial config, between LDS and RDS, the push will miss the
-			// monitored 'routes'. Same for CDS/EDS interval. It is very tricky to handle
-			// due to the protocol - but the periodic push recovers from it.
-			if features.EnableFlowControl {
-				adsLog.Infof("semwait2 within send thread")
-				<-con.semsend
-			}
-			err := s.pushConnection(con, pushEv)
+			s.pushConnection(con, pushEv)
 			pushEv.done()
-			if err != nil {
-				if features.EnableFlowControl {
-					adsLog.Infof("Closing semsend channel")
-					close(con.semsend)
-					close(con.semrecv)
-				}
-				return nil
-			}
-			if features.EnableFlowControl {
-				adsLog.Infof("sempost2 within send thread")
-				con.semrecv <- struct{}{}
-			}
+			return nil
 		}
 	}
 }
 
 // Manage the ack if EnableFlowControl is set.
-// The ack is managed by waiting for a semaphore posted to the recv thread and
-// sending an empty struct to the semaphore in the send thread.
-func manageAck(con *Connection) {
-	if features.EnableFlowControl {
-		<-con.semrecv
-		con.semsend <- struct{}{}
+// Benchmark looks good with this initial take. :-)
+func (s *DiscoveryServer) manageAck(con *Connection, typeUrl string) error {
+	if con.proxy.WatchedResources == nil || con.proxy.WatchedResources[typeUrl] == nil {
+		return nil
 	}
+
+	ctx := context.TODO()
+
+	if features.EnableFlowControl {
+		// Retrieve the nonce sent and the nonce acked
+		con.proxy.RLock()
+		acked := con.proxy.WatchedResources[typeUrl].NonceAcked
+		sent := con.proxy.WatchedResources[typeUrl].NonceSent
+		con.proxy.RUnlock()
+
+		// Try to acquire the semaphore. If the semaphore is in use,
+		// the last time the noncees were compared, they were not equivalent.
+		// In this case, compare the noncees again and release the semaphore
+		// if they are equivalent. This may be doable with a RWlock.
+		acquire := con.sem[typeUrl].TryAcquire(1)
+		if acquire == false {
+			if acked == sent {
+				con.sem[typeUrl].Release(1)
+			}
+		}
+
+		// Always acquire the semaphore. This logic isn't quite right, as
+		// we should probably compare the nonces prior to acquisition. This
+		// will result in the next unmatched nonce executing the logic above.
+		if err := con.sem[typeUrl].Acquire(ctx, 1); err != nil {
+			return errors.New("failed to acquire semaphore")
+		}
+	}
+	return nil
 }
 
 // shouldRespond determines whether this request needs to be responded back. It applies the ack/nack rules as per xds protocol
@@ -331,7 +338,7 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 	}
 
 	if shouldUnsubscribe(request) {
-		adsLog.Debugf("ADS:%s: UNSUBSCRIBE %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
+		adsLog.Infof("ADS:%s: UNSUBSCRIBE %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
 		con.proxy.Lock()
 		delete(con.proxy.WatchedResources, request.TypeUrl)
 		con.proxy.Unlock()
@@ -340,7 +347,7 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 
 	// This is first request - initialize typeUrl watches.
 	if request.ResponseNonce == "" {
-		adsLog.Debugf("ADS:%s: INIT %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
+		adsLog.Infof("ADS:%s: INIT %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
 		con.proxy.Lock()
 		con.proxy.WatchedResources[request.TypeUrl] = &model.WatchedResource{TypeUrl: request.TypeUrl, ResourceNames: request.ResourceNames, LastRequest: request}
 		con.proxy.Unlock()
@@ -362,14 +369,13 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 		con.proxy.WatchedResources[request.TypeUrl] = &model.WatchedResource{TypeUrl: request.TypeUrl, ResourceNames: request.ResourceNames, LastRequest: request}
 		con.proxy.Unlock()
 		// All true returns are an ACK + Flow Control - minus the above
-		manageAck(con)
 		return true
 	}
 
 	// If there is mismatch in the nonce, that is a case of expired/stale nonce.
 	// A nonce becomes stale following a newer nonce being sent to Envoy.
 	if request.ResponseNonce != previousInfo.NonceSent {
-		adsLog.Debugf("ADS:%s: REQ %s Expired nonce received %s, sent %s", stype,
+		adsLog.Infof("ADS:%s: REQ %s Expired nonce received %s, sent %s", stype,
 			con.ConID, request.ResponseNonce, previousInfo.NonceSent)
 		xdsExpiredNonce.Increment()
 		return false
@@ -389,13 +395,11 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 	// when it detects a new resource. We should respond if they change.
 	if listEqualUnordered(previousResources, request.ResourceNames) {
 		adsLog.Debugf("ADS:%s: ACK %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
-		manageAck(con)
 		return false
 	}
 	adsLog.Debugf("ADS:%s: RESOURCE CHANGE previous resources: %v, new resources: %v %s %s %s", stype,
 		previousResources, request.ResourceNames, con.ConID, request.VersionInfo, request.ResponseNonce)
 
-	manageAck(con)
 	return true
 }
 
@@ -620,6 +624,7 @@ func (s *DiscoveryServer) pushConnection(con *Connection, pushEv *Event) error {
 	// Send pushes to all generators
 	// Each Generator is responsible for determining if the push event requires a push
 	for _, w := range getPushResources(con.proxy.WatchedResources) {
+		s.manageAck(con, w.TypeUrl)
 		err := s.pushXds(con, pushRequest.Push, currentVersion, w, pushRequest)
 		if err != nil {
 			return err
