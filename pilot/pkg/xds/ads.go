@@ -160,9 +160,11 @@ func (s *DiscoveryServer) receive(con *Connection, reqChannel chan *discovery.Di
 			}()
 		}
 
-		// Determine ACK/NACK response
-		respond := s.shouldRespond(con, req)
-		if !respond {
+		if s.StatusReporter != nil {
+			s.StatusReporter.RegisterEvent(con.ConID, req.TypeUrl, req.ResponseNonce)
+		}
+
+		if !s.shouldRespond(con, req) {
 			continue
 		}
 
@@ -179,10 +181,6 @@ func (s *DiscoveryServer) receive(con *Connection, reqChannel chan *discovery.Di
 // handles 'push' requests and close - the code will eventually call the 'push' code, and it needs more mutex
 // protection. Original code avoided the mutexes by doing both 'push' and 'process requests' in same thread.
 func (s *DiscoveryServer) processRequest(req *discovery.DiscoveryRequest, con *Connection) error {
-	if s.StatusReporter != nil {
-		s.StatusReporter.RegisterEvent(con.ConID, req.TypeUrl, req.ResponseNonce)
-	}
-
 	push := s.globalPushContext()
 
 	return s.pushXds(con, push, versionInfo(), con.Watched(req.TypeUrl), &model.PushRequest{Full: true})
@@ -266,7 +264,6 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 				// Remote side closed connection or error processing the request.
 				return receiveError
 			}
-
 			// processRequest is calling pushXXX, accessing common structs with pushConnection.
 			// Adding sync is the second issue to be resolved if we want to save 1/2 of the threads.
 			err := s.processRequest(req, con)
@@ -275,9 +272,15 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 			}
 
 		case pushEv := <-con.pushChannel:
-			s.pushConnection(con, pushEv)
+			err := s.pushConnection(con, pushEv)
 			pushEv.done()
-			return nil
+			// TODO: possible race condition: if a config change happens while the envoy				s.pushConnection(con, pushEv)
+			// was getting the initial config, between LDS and RDS, the push will miss the
+			// monitored 'routes'. Same for CDS/EDS interval. It is very tricky to handle
+			// due to the protocol - but the periodic push recovers from it.
+			if err != nil {
+				return nil
+			}
 		}
 	}
 }
@@ -338,7 +341,7 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 	}
 
 	if shouldUnsubscribe(request) {
-		adsLog.Infof("ADS:%s: UNSUBSCRIBE %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
+		adsLog.Debugf("ADS:%s: UNSUBSCRIBE %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
 		con.proxy.Lock()
 		delete(con.proxy.WatchedResources, request.TypeUrl)
 		con.proxy.Unlock()
@@ -347,11 +350,10 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 
 	// This is first request - initialize typeUrl watches.
 	if request.ResponseNonce == "" {
-		adsLog.Infof("ADS:%s: INIT %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
+		adsLog.Debugf("ADS:%s: INIT %s %s %s", stype, con.ConID, request.VersionInfo, request.ResponseNonce)
 		con.proxy.Lock()
 		con.proxy.WatchedResources[request.TypeUrl] = &model.WatchedResource{TypeUrl: request.TypeUrl, ResourceNames: request.ResourceNames, LastRequest: request}
 		con.proxy.Unlock()
-		// Does require ACK but does not require flow control sem(?)
 		return true
 	}
 
