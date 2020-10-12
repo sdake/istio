@@ -286,7 +286,6 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 }
 
 // Manage the ack if EnableFlowControl is set.
-// Benchmark looks good with this initial take. :-)
 func (s *DiscoveryServer) manageAck(con *Connection, typeUrl string) error {
 	if con.proxy.WatchedResources == nil || con.proxy.WatchedResources[typeUrl] == nil {
 		return nil
@@ -305,19 +304,14 @@ func (s *DiscoveryServer) manageAck(con *Connection, typeUrl string) error {
 		// the last time the noncees were compared, they were not equivalent.
 		// In this case, compare the noncees again and release the semaphore
 		// if they are equivalent. This may be doable with a RWlock.
-		acquire := con.sem[typeUrl].TryAcquire(1)
-		if acquire == false {
-			if acked == sent {
+		if acked != sent {
+			con.sem[typeUrl].Acquire(ctx, 1)
+		} else {
+			if con.sem[typeUrl].TryAcquire(1) {
 				con.sem[typeUrl].Release(1)
 			}
 		}
 
-		// Always acquire the semaphore. This logic isn't quite right, as
-		// we should probably compare the nonces prior to acquisition. This
-		// will result in the next unmatched nonce executing the logic above.
-		if err := con.sem[typeUrl].Acquire(ctx, 1); err != nil {
-			return errors.New("failed to acquire semaphore")
-		}
 	}
 	return nil
 }
@@ -370,14 +364,13 @@ func (s *DiscoveryServer) shouldRespond(con *Connection, request *discovery.Disc
 		con.proxy.Lock()
 		con.proxy.WatchedResources[request.TypeUrl] = &model.WatchedResource{TypeUrl: request.TypeUrl, ResourceNames: request.ResourceNames, LastRequest: request}
 		con.proxy.Unlock()
-		// All true returns are an ACK + Flow Control - minus the above
 		return true
 	}
 
 	// If there is mismatch in the nonce, that is a case of expired/stale nonce.
 	// A nonce becomes stale following a newer nonce being sent to Envoy.
 	if request.ResponseNonce != previousInfo.NonceSent {
-		adsLog.Infof("ADS:%s: REQ %s Expired nonce received %s, sent %s", stype,
+		adsLog.Debugf("ADS:%s: REQ %s Expired nonce received %s, sent %s", stype,
 			con.ConID, request.ResponseNonce, previousInfo.NonceSent)
 		xdsExpiredNonce.Increment()
 		return false
