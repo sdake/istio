@@ -86,7 +86,11 @@ type Connection struct {
 	node *core.Node
 
 	// A map of channels representing each resource type
-	sem map[string]*semaphore.Weighted
+	semsend map[string]*semaphore.Weighted
+
+	semrecv map[string]*semaphore.Weighted
+
+	ctx context.Context
 }
 
 // Event represents a config or registry event that results in a push.
@@ -168,6 +172,9 @@ func (s *DiscoveryServer) receive(con *Connection, reqChannel chan *discovery.Di
 			continue
 		}
 
+		adsLog.Infof("con.semrecv acquire")
+		con.semrecv[req.TypeUrl].Acquire(con.ctx, 1)
+
 		select {
 		case reqChannel <- req:
 		case <-con.stream.Context().Done():
@@ -229,12 +236,20 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 
 	// Initialize the semaphore
 	if features.EnableFlowControl {
-		con.sem = make(map[string]*semaphore.Weighted)
+		con.semsend = make(map[string]*semaphore.Weighted)
+		con.semrecv = make(map[string]*semaphore.Weighted)
 
-		con.sem[v3.ClusterType] = semaphore.NewWeighted(1)
-		con.sem[v3.EndpointType] = semaphore.NewWeighted(1)
-		con.sem[v3.ListenerType] = semaphore.NewWeighted(1)
-		con.sem[v3.RouteType] = semaphore.NewWeighted(1)
+		con.semsend[v3.ClusterType] = semaphore.NewWeighted(1)
+		con.semsend[v3.EndpointType] = semaphore.NewWeighted(1)
+		con.semsend[v3.ListenerType] = semaphore.NewWeighted(1)
+		con.semsend[v3.RouteType] = semaphore.NewWeighted(1)
+
+		con.semrecv[v3.ClusterType] = semaphore.NewWeighted(1)
+		con.semrecv[v3.EndpointType] = semaphore.NewWeighted(1)
+		con.semrecv[v3.ListenerType] = semaphore.NewWeighted(1)
+		con.semrecv[v3.RouteType] = semaphore.NewWeighted(1)
+
+		con.ctx = context.TODO()
 	}
 
 	// Do not call: defer close(con.pushChannel). The push channel will be garbage collected
@@ -283,37 +298,6 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream discovery.AggregatedD
 			}
 		}
 	}
-}
-
-// Manage the ack if EnableFlowControl is set.
-func (s *DiscoveryServer) manageAck(con *Connection, typeUrl string) error {
-	if con.proxy.WatchedResources == nil || con.proxy.WatchedResources[typeUrl] == nil {
-		return nil
-	}
-
-	ctx := context.TODO()
-
-	if features.EnableFlowControl {
-		// Retrieve the nonce sent and the nonce acked
-		con.proxy.RLock()
-		acked := con.proxy.WatchedResources[typeUrl].NonceAcked
-		sent := con.proxy.WatchedResources[typeUrl].NonceSent
-		con.proxy.RUnlock()
-
-		// Try to acquire the semaphore. If the semaphore is in use,
-		// the last time the noncees were compared, they were not equivalent.
-		// In this case, compare the noncees again and release the semaphore
-		// if they are equivalent. This may be doable with a RWlock.
-		if acked != sent {
-			con.sem[typeUrl].Acquire(ctx, 1)
-		} else {
-			if con.sem[typeUrl].TryAcquire(1) {
-				con.sem[typeUrl].Release(1)
-			}
-		}
-
-	}
-	return nil
 }
 
 // shouldRespond determines whether this request needs to be responded back. It applies the ack/nack rules as per xds protocol
@@ -619,11 +603,16 @@ func (s *DiscoveryServer) pushConnection(con *Connection, pushEv *Event) error {
 	// Send pushes to all generators
 	// Each Generator is responsible for determining if the push event requires a push
 	for _, w := range getPushResources(con.proxy.WatchedResources) {
-		s.manageAck(con, w.TypeUrl)
+		adsLog.Infof("con.semsend acquire")
+		con.semsend[w.TypeUrl].Acquire(con.ctx, 1)
 		err := s.pushXds(con, pushRequest.Push, currentVersion, w, pushRequest)
 		if err != nil {
+			adsLog.Infof("con.semsend release")
+			con.semsend[w.TypeUrl].Release(1)
 			return err
 		}
+		adsLog.Infof("con.semrecv release")
+		con.semrecv[w.TypeUrl].Release(1)
 	}
 	if pushRequest.Full {
 		// Report all events for unwatched resources. Watched resources will be reported in pushXds or on ack.
